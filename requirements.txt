@@ -1,0 +1,8 @@
+streamlit
+yfinance
+pandas
+numpy
+plotly
+beautifulsoup4
+requests
+lxml # Diperlukan oleh yfinance dan bs4
