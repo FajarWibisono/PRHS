@@ -6,3 +6,4 @@ plotly
 beautifulsoup4
 requests
 lxml # Diperlukan oleh yfinance dan bs4
+reportlab>=4.0.0
