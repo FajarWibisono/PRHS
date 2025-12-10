@@ -863,7 +863,7 @@ st.markdown("Navigasi dinamika pasar saham menjadi lebih mudah dengan bantuan Hu
 st.markdown("Calculator ini membantu memberikan **PRAKIRAAN HARGA**. Masukkan ticker KODE SAHAM (XXXX) dan **PER Sektor Industri serta PBV Sektor Industri.**")
 st.markdown(
     "Masukkan di pencarian KODE SAHAM lalu geser kekanan sampai menemukan **P/E Ratio X, dan Price to BV X.** "
-    "Untuk referensi, kunjungi: [IDX Financial Data and Ratio](https://idx.co.id/id/data-pasar/laporan-statistik/digital-statistic/monthly/financial-report-and-ratio-of-listed-companies/financial-data-and-ratio)"
+    "Untuk referensi, kunjungi: [IDX Financial Data and Ratio](https://idx.co.id/id/data-pasar/laporan-statistik/digital-statistic/monthly/financial-report-and-ratio-of-listed-companies/financial-data-and-ratio?filter=eyJ5ZWFyIjoiMjAyNSIsIm1vbnRoIjoiMTEiLCJxdWFydGVyIjowLCJ0eXBlIjoibW9udGhseSJ9)"
 )
 
 # Input Form
@@ -920,3 +920,4 @@ if submit_button:
                 pdf_link = export_to_pdf(stock_data, estimates, per_industry, pbv_industry)
                 st.markdown(pdf_link, unsafe_allow_html=True)
                 st.success("✅ Perhitungan selesai!")
+
