@@ -1,447 +1,892 @@
-"""
-app.py — Streamlit UI for FUNDAMENTAL Stock Future Value Analyzer
-Language: Bahasa Indonesia
-"""
-
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
+from datetime import datetime
+from io import BytesIO
+import re
 import plotly.graph_objects as go
-import plotly.express as px
+import warnings
 
-from data_fetcher import fetch_stock_data
-from fcds_t_calculator import calculate_fcds_t
+warnings.filterwarnings("ignore")
 
-# ── Page config ────────────────────────────────────────────────────────────────
+# ============================================================
+# PAGE CONFIG
+# ============================================================
 st.set_page_config(
-    page_title="Fundamental Future Value Analyzer",
+    page_title="PRHS — Perkiraan Rentang Harga Saham",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-# ── Helper formatters ──────────────────────────────────────────────────────────
-
-def fmt_currency(val, currency="IDR", decimals=0):
-    """Format number as currency string."""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return "—"
-    prefix = "Rp " if currency == "IDR" else "$ "
-    if decimals == 0:
-        return f"{prefix}{val:,.0f}"
-    return f"{prefix}{val:,.{decimals}f}"
-
-
-def fmt_pct(val, decimals=2):
-    """Format as percentage string."""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return "—"
-    return f"{val:+.{decimals}f}%"
-
-
-def fmt_num(val, decimals=2):
-    """Format plain number."""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return "—"
-    return f"{val:,.{decimals}f}"
+st.markdown("""
+<style>
+    div[data-testid="metric-container"] {
+        background: #f8f9fb;
+        border: 1px solid #e0e4ea;
+        border-radius: 10px;
+        padding: 12px 16px;
+    }
+    .output-header {
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: #1a5276;
+        margin-bottom: 4px;
+    }
+    thead tr th {
+        background-color: #1a5276 !important;
+        color: white !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
-def safe_float(val):
-    """Return float or NaN for session state."""
+# ============================================================
+# HELPERS
+# ============================================================
+def normalize_ticker(code: str) -> str:
+    code = code.strip().upper()
+    if "." not in code:
+        code += ".JK"
+    return code
+
+
+def fmt_rp(val) -> str:
+    if pd.isna(val):
+        return "N/A"
+    return f"Rp {val:,.2f}"
+
+
+def fmt_rp_short(val) -> str:
+    if pd.isna(val):
+        return "N/A"
+    return f"Rp {val:,.0f}"
+
+
+def safe_get(d: dict, *keys, default=None):
+    for k in keys:
+        v = d.get(k)
+        if v is not None:
+            return v
+    return default
+
+
+# ============================================================
+# DATA FETCHING
+# ============================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_stock_data(symbol: str) -> dict:
+    ticker = yf.Ticker(symbol)
+    info = ticker.info
+
+    if not info or info.get("quoteType") in (None, "NONE", ""):
+        raise ValueError(f"Saham '{symbol}' tidak ditemukan atau tidak tersedia di Yahoo Finance.")
+
+    company_name = safe_get(info, "longName", "shortName", default=symbol)
+    current_price = safe_get(info, "currentPrice", "regularMarketPrice", "previousClose")
+    current_eps   = safe_get(info, "trailingEps")
+    current_bvps  = safe_get(info, "bookValue")
+    shares        = safe_get(info, "sharesOutstanding")
+    sector        = info.get("sector", "")
+    industry      = info.get("industry", "")
+
+    # ---- Annual High / Low Prices (5 years) ----
+    hist = ticker.history(period="5y", interval="1d")
+    annual_prices = []
+    if not hist.empty:
+        hist.index = pd.to_datetime(hist.index)
+        hist["Year"] = hist.index.year
+        grp = hist.groupby("Year").agg(High=("High", "max"), Low=("Low", "min"))
+        grp = grp[grp.index <= datetime.now().year]
+        grp = grp.tail(5)
+        for yr, row in grp.iterrows():
+            annual_prices.append({"Tahun": int(yr), "Harga Tertinggi": row["High"], "Harga Terendah": row["Low"]})
+
+    # ---- Annual EPS from Financials ----
+    eps_by_year: dict[int, float] = {}
     try:
-        return float(val)
-    except (TypeError, ValueError):
-        return np.nan
-
-
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("⚙️ Pengaturan Proyeksi")
-    projection_years = st.slider("Tahun Proyeksi", min_value=1, max_value=10, value=5, step=1)
-
-    st.subheader("Bobot Komponen FV")
-    w_bv = st.number_input("Bobot BV (%)", min_value=0, max_value=100, value=50, step=5)
-    w_eps = st.number_input("Bobot EPS (%)", min_value=0, max_value=100, value=40, step=5)
-    w_sps = st.number_input("Bobot SPS (%)", min_value=0, max_value=100, value=10, step=5)
-    total_w = w_bv + w_eps + w_sps
-    if total_w != 100:
-        st.warning(f"Total bobot = {total_w}%. Akan dinormalisasi otomatis.")
-
-    st.divider()
-    st.caption("**FUNS FUVA** = FUNdamental Stock FUture Value Analysis")
-    st.caption("Metode value investing berbasis proyeksi fundamentals 5 tahun.")
-
-# ── Header ─────────────────────────────────────────────────────────────────────
-st.title("📈 FUNDAMENTAL Stock Future Value Analyzer")
-st.markdown(
-    "Estimasi **harga wajar masa depan** saham menggunakan pendekatan fundamental"
-    "berdasarkan pertumbuhan BV, EPS, dan SPS historis yang dikomposit."
-)
-
-# ── Session State Init ─────────────────────────────────────────────────────────
-if "fetched" not in st.session_state:
-    st.session_state.fetched = {}
-if "overrides" not in st.session_state:
-    st.session_state.overrides = {}
-if "current_ticker" not in st.session_state:
-    st.session_state.current_ticker = ""
-if "reset_count" not in st.session_state:
-    st.session_state.reset_count = 0
-
-# ── Input Section ──────────────────────────────────────────────────────────────
-col_input, col_btn = st.columns([3, 1], vertical_alignment="bottom")
-with col_input:
-    ticker_input = st.text_input(
-        "Kode Saham",
-        placeholder="Contoh: BMRI (IDX) atau NVDA (US)",
-        help="Untuk saham IDX, cukup ketik kode tanpa .JK (misal BMRI). Untuk US ketik langsung (NVDA).",
-        key=f"ticker_input_{st.session_state.reset_count}",
-    )
-with col_btn:
-    analyze_btn = st.button("🔍 Analisis", use_container_width=True, type="primary")
-
-# ── Fetch on button click ──────────────────────────────────────────────────────
-if analyze_btn and ticker_input.strip():
-    with st.spinner(f"Mengambil data {ticker_input.upper()}..."):
-        data = fetch_stock_data(ticker_input)
-
-    if data.get("error") and not data.get("last_price"):
-        st.error(f"❌ Gagal mengambil data untuk **{ticker_input.upper()}**: {data['error']}")
-    else:
-        st.session_state.fetched = data
-        st.session_state.overrides = {}  # reset overrides for new ticker
-        st.session_state.current_ticker = ticker_input
-
-# ── Main content (only if data is available) ───────────────────────────────────
-if st.session_state.fetched:
-    fd = st.session_state.fetched
-    currency = fd.get("currency", "IDR")
-    dq = fd.get("data_quality", {})
-
-    # Show fetch warnings
-    missing_fields = [k for k, v in dq.items() if v == "missing"]
-    if missing_fields:
-        st.warning(
-            f"⚠️ Data berikut tidak tersedia dari yfinance dan perlu diisi manual: "
-            f"**{', '.join(missing_fields)}**"
+        fin = ticker.financials  # rows=metrics, cols=fiscal-year dates
+        ni_key = next(
+            (k for k in ["Net Income", "Net Income Common Stockholders", "NetIncome"] if k in fin.index),
+            None,
         )
-    if fd.get("error"):
-        st.info(f"ℹ️ Catatan fetcher: {fd['error']}")
+        if ni_key and shares and shares > 0:
+            ni = fin.loc[ni_key]
+            for col in ni.index:
+                yr = pd.to_datetime(col).year
+                val = ni[col]
+                if pd.notna(val):
+                    eps_by_year[yr] = float(val) / shares
+    except Exception:
+        pass
 
-    st.subheader(f"🏢 {fd.get('company_name', '')} ({fd.get('ticker', '')})")
+    # Fallback: trailingEps as current year
+    if current_eps and datetime.now().year not in eps_by_year:
+        eps_by_year[datetime.now().year] = float(current_eps)
 
-    # ── Editable Input Fields ──────────────────────────────────────────────────
-    st.markdown("### 📊 Data Fundamental")
-    st.caption("Data diambil otomatis. Anda dapat mengubah nilai jika diperlukan.")
+    # ---- Annual BVPS from Balance Sheet ----
+    bvps_by_year: dict[int, float] = {}
+    try:
+        bs = ticker.balance_sheet
+        eq_key = next(
+            (k for k in ["Stockholders Equity", "Common Stock Equity", "Total Stockholder Equity"] if k in bs.index),
+            None,
+        )
+        if eq_key and shares and shares > 0:
+            eq = bs.loc[eq_key]
+            for col in eq.index:
+                yr = pd.to_datetime(col).year
+                val = eq[col]
+                if pd.notna(val):
+                    bvps_by_year[yr] = float(val) / shares
+    except Exception:
+        pass
 
-    def get_val(key, default=0.0):
-        """Get override or fetched value."""
-        ov = st.session_state.overrides.get(key)
-        if ov is not None:
-            return ov
-        v = fd.get(key, np.nan)
-        return float(v) if pd.notna(v) else default
+    if current_bvps and datetime.now().year not in bvps_by_year:
+        bvps_by_year[datetime.now().year] = float(current_bvps)
 
-    left_col, right_col = st.columns(2)
-
-    with left_col:
-        st.markdown("**Data Saham Terkini**")
-
-        last_price = st.number_input(
-            "Harga Terakhir",
-            value=get_val("last_price"),
-            min_value=0.0,
-            format="%.2f",
-            key="inp_last_price",
-            help="Harga penutupan terakhir"
-        )
-        bv_per_share = st.number_input(
-            "Book Value per Saham (BV)",
-            value=get_val("bv_per_share"),
-            min_value=0.0,
-            format="%.2f",
-            key="inp_bv",
-            help="Ekuitas per saham"
-        )
-        eps_ttm = st.number_input(
-            "EPS (Laba per Saham)",
-            value=get_val("eps_ttm"),
-            format="%.4f",
-            key="inp_eps",
-            help="Earnings per share, TTM"
-        )
-        sps_ttm = st.number_input(
-            "SPS (Penjualan per Saham)",
-            value=get_val("sps_ttm"),
-            min_value=0.0,
-            format="%.4f",
-            key="inp_sps",
-            help="Sales per share, TTM"
-        )
-        _dpr_raw = get_val("dpr", 0.0)
-        _dpr_safe = float(np.clip(_dpr_raw, 0.0, 2.0))
-        dpr_val = st.number_input(
-            "DPR (Dividend Payout Ratio)",
-            value=_dpr_safe,
-            min_value=0.0,
-            max_value=2.0,
-            format="%.4f",
-            key="inp_dpr",
-            help="Rasio pembagian dividen (0.30 = 30%). Maksimum 2.0 (200%)."
-        )
-
-    with right_col:
-        st.markdown("**Rata-rata Historis & Pertumbuhan**")
-
-        avg_pbv = st.number_input(
-            "Rata-rata PBV historis",
-            value=get_val("avg_pbv", 1.0),
-            min_value=0.0,
-            format="%.2f",
-            key="inp_avg_pbv",
-            help="Price-to-Book Value rata-rata 5 tahun"
-        )
-        avg_per = st.number_input(
-            "Rata-rata PER historis",
-            value=get_val("avg_per", 10.0),
-            min_value=0.0,
-            format="%.2f",
-            key="inp_avg_per",
-            help="Price-to-Earnings Ratio rata-rata 5 tahun"
-        )
-        avg_psr = st.number_input(
-            "Rata-rata PSR historis",
-            value=get_val("avg_psr", 1.0),
-            min_value=0.0,
-            format="%.2f",
-            key="inp_avg_psr",
-            help="Price-to-Sales Ratio rata-rata 5 tahun"
-        )
-
-        st.markdown("**ROE**")
-        roe_annual = st.number_input(
-            "ROE Tahunan (decimal)",
-            value=get_val("roe_annual", 0.15),
-            format="%.4f",
-            key="inp_roe_annual",
-            help="Return on Equity tahun terakhir (mis. 0.20 = 20%)"
-        )
-        roe_5yr = st.number_input(
-            "ROE 5 Tahun (rata-rata)",
-            value=get_val("roe_5yr", 0.15),
-            format="%.4f",
-            key="inp_roe_5yr",
-        )
-
-        st.markdown("**Pertumbuhan EPS**")
-        eps_gr_annual = st.number_input(
-            "EPS Growth Tahunan",
-            value=get_val("eps_growth_annual", 0.10),
-            format="%.4f",
-            key="inp_eps_gr_annual",
-            help="Pertumbuhan EPS tahun terakhir (mis. 0.10 = 10%)"
-        )
-        eps_gr_5yr = st.number_input(
-            "EPS Growth 5 Tahun (CAGR)",
-            value=get_val("eps_growth_5yr", 0.10),
-            format="%.4f",
-            key="inp_eps_gr_5yr",
-        )
-
-        st.markdown("**Pertumbuhan SPS**")
-        sps_gr_annual = st.number_input(
-            "SPS Growth Tahunan",
-            value=get_val("sps_growth_annual", 0.08),
-            format="%.4f",
-            key="inp_sps_gr_annual",
-        )
-        sps_gr_5yr = st.number_input(
-            "SPS Growth 5 Tahun (CAGR)",
-            value=get_val("sps_growth_5yr", 0.08),
-            format="%.4f",
-            key="inp_sps_gr_5yr",
-        )
-
-    # ── Run calculation ────────────────────────────────────────────────────────
-    params = {
-        "last_price": last_price,
-        "bv_per_share": bv_per_share,
-        "eps_ttm": eps_ttm,
-        "sps_ttm": sps_ttm,
-        "roe_annual": roe_annual,
-        "roe_5yr": roe_5yr,
-        "eps_growth_annual": eps_gr_annual,
-        "eps_growth_5yr": eps_gr_5yr,
-        "sps_growth_annual": sps_gr_annual,
-        "sps_growth_5yr": sps_gr_5yr,
-        "avg_pbv": avg_pbv,
-        "avg_per": avg_per,
-        "avg_psr": avg_psr,
-        "dpr": dpr_val,
-        "projection_years": projection_years,
-        "weight_bv": w_bv / 100,
-        "weight_eps": w_eps / 100,
-        "weight_sps": w_sps / 100,
+    return {
+        "company_name": company_name,
+        "sector": sector,
+        "industry": industry,
+        "current_price": current_price,
+        "current_eps": current_eps,
+        "current_bvps": current_bvps,
+        "shares": shares,
+        "annual_prices": annual_prices,
+        "eps_by_year": eps_by_year,
+        "bvps_by_year": bvps_by_year,
     }
 
-    calc = calculate_fcds_t(params)
 
-    if calc.get("error"):
-        st.error(f"❌ Error kalkulasi: {calc['error']}")
+# ============================================================
+# BUILD HISTORICAL TABLE
+# ============================================================
+def build_hist_table(annual_prices: list, eps_by_year: dict, bvps_by_year: dict) -> pd.DataFrame:
+    rows = []
+    for item in annual_prices:
+        yr   = item["Tahun"]
+        high = item["Harga Tertinggi"]
+        low  = item["Harga Terendah"]
+        eps  = eps_by_year.get(yr)
+        bvps = bvps_by_year.get(yr)
+
+        per_high = high / eps  if (eps  and eps  > 0) else np.nan
+        per_low  = low  / eps  if (eps  and eps  > 0) else np.nan
+        pbv_high = high / bvps if (bvps and bvps > 0) else np.nan
+        pbv_low  = low  / bvps if (bvps and bvps > 0) else np.nan
+
+        rows.append({
+            "Tahun":           yr,
+            "Harga Tertinggi": high,
+            "Harga Terendah":  low,
+            "EPS":             eps,
+            "BVPS":            bvps,
+            "PER Tertinggi":   per_high,
+            "PER Terendah":    per_low,
+            "PBV Tertinggi":   pbv_high,
+            "PBV Terendah":    pbv_low,
+        })
+    return pd.DataFrame(rows)
+
+
+def recalc_derived(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for i, row in df.iterrows():
+        eps  = row["EPS"]
+        bvps = row["BVPS"]
+        high = row["Harga Tertinggi"]
+        low  = row["Harga Terendah"]
+        df.at[i, "PER Tertinggi"] = high / eps  if (pd.notna(eps)  and eps  > 0) else np.nan
+        df.at[i, "PER Terendah"]  = low  / eps  if (pd.notna(eps)  and eps  > 0) else np.nan
+        df.at[i, "PBV Tertinggi"] = high / bvps if (pd.notna(bvps) and bvps > 0) else np.nan
+        df.at[i, "PBV Terendah"]  = low  / bvps if (pd.notna(bvps) and bvps > 0) else np.nan
+    return df
+
+
+# ============================================================
+# EPS GROWTH ESTIMATION
+# ============================================================
+def estimate_eps_growth(eps_by_year: dict) -> tuple[float | None, float | None]:
+    """Returns (cagr, estimated_eps_next_year)."""
+    valid = sorted([(yr, v) for yr, v in eps_by_year.items() if v and v > 0])
+    if len(valid) < 2:
+        return None, None
+    oldest_yr, oldest_val = valid[0]
+    latest_yr, latest_val = valid[-1]
+    n = latest_yr - oldest_yr
+    if n <= 0:
+        return None, None
+    cagr = (latest_val / oldest_val) ** (1 / n) - 1
+    eps_est = latest_val * (1 + cagr)
+    return cagr, eps_est
+
+
+# ============================================================
+# SCENARIO CALCULATIONS
+# ============================================================
+def calculate_scenarios(
+    df: pd.DataFrame,
+    eps_est: float,
+    bvps_current: float,
+    per_industri: float | None,
+    pbv_industri: float | None,
+) -> pd.DataFrame:
+
+    valid_per = df[df["EPS"].notna() & (df["EPS"] > 0) & df["PER Tertinggi"].notna()]
+    valid_bv  = df[df["BVPS"].notna() & (df["BVPS"] > 0) & df["PBV Tertinggi"].notna()]
+
+    results = []
+
+    # ── 1. Estimasi Optimis ──────────────────────────────────────────────────
+    # Batas Atas  = max(PER Tertinggi 5 thn) × EPS estimated
+    # Batas Bawah = max(PER Terendah  5 thn) × EPS estimated
+    if not valid_per.empty:
+        max_per_h = valid_per["PER Tertinggi"].max()
+        max_per_l = valid_per["PER Terendah"].max()
+        results.append({
+            "Skenario":    "🚀 Estimasi Optimis",
+            "Batas Atas":  round(max_per_h * eps_est, 2),
+            "Batas Bawah": round(max_per_l * eps_est, 2),
+            "_note":       f"PER Tertinggi maks={max_per_h:.1f}x | PER Terendah maks={max_per_l:.1f}x",
+        })
     else:
-        # ── Results Section ────────────────────────────────────────────────────
-        st.divider()
-        st.markdown("## 🎯 Hasil Analisis FUNS FUVA")
+        results.append({"Skenario": "🚀 Estimasi Optimis", "Batas Atas": None, "Batas Bawah": None, "_note": "Data EPS tidak tersedia"})
 
-        # Signal badge
-        signal = calc.get("signal", "N/A")
-        signal_colors = {
-            "UNDERVALUED": ("✅", "green", "UNDERVALUED — Harga di Bawah Nilai Wajar"),
-            "FAIR VALUE":  ("⚠️", "orange", "FAIR VALUE — Harga Mendekati Nilai Wajar"),
-            "OVERVALUED":  ("❌", "red", "OVERVALUED — Harga Di Atas Nilai Wajar"),
-            "N/A":         ("❓", "gray", "Data Tidak Cukup"),
-        }
-        icon, color, label = signal_colors.get(signal, ("❓", "gray", signal))
-        st.markdown(
-            f"<div style='background-color: {color}; color: white; padding: 12px 20px; "
-            f"border-radius: 8px; font-size: 18px; font-weight: bold; text-align: center;'>"
-            f"{icon} {label}</div>",
-            unsafe_allow_html=True,
+    # ── 2. Estimasi Netral ───────────────────────────────────────────────────
+    # Batas Atas  = avg(PER Tertinggi 5 thn) × EPS estimated
+    # Batas Bawah = avg(PER Terendah  5 thn) × EPS estimated
+    if not valid_per.empty:
+        avg_per_h = valid_per["PER Tertinggi"].mean()
+        avg_per_l = valid_per["PER Terendah"].mean()
+        results.append({
+            "Skenario":    "⚖️ Estimasi Netral",
+            "Batas Atas":  round(avg_per_h * eps_est, 2),
+            "Batas Bawah": round(avg_per_l * eps_est, 2),
+            "_note":       f"PER Tertinggi rata={avg_per_h:.1f}x | PER Terendah rata={avg_per_l:.1f}x",
+        })
+    else:
+        results.append({"Skenario": "⚖️ Estimasi Netral", "Batas Atas": None, "Batas Bawah": None, "_note": "Data EPS tidak tersedia"})
+
+    # ── 3. Rerata BV (Book Value) ────────────────────────────────────────────
+    # Batas Atas  = avg(PBV Tertinggi historis) × BVPS saat ini
+    # Batas Bawah = avg(PBV Terendah  historis) × BVPS saat ini
+    if not valid_bv.empty and bvps_current and bvps_current > 0:
+        avg_pbv_h = valid_bv["PBV Tertinggi"].mean()
+        avg_pbv_l = valid_bv["PBV Terendah"].mean()
+        results.append({
+            "Skenario":    "📚 Rerata BV",
+            "Batas Atas":  round(avg_pbv_h * bvps_current, 2),
+            "Batas Bawah": round(avg_pbv_l * bvps_current, 2),
+            "_note":       f"PBV Tertinggi rata={avg_pbv_h:.2f}x | PBV Terendah rata={avg_pbv_l:.2f}x",
+        })
+    else:
+        results.append({"Skenario": "📚 Rerata BV", "Batas Atas": None, "Batas Bawah": None, "_note": "Data BVPS tidak tersedia"})
+
+    # ── 4. Rerata PER Industri ───────────────────────────────────────────────
+    # Nilai estimasi = PER Industri × EPS estimated  (satu nilai tunggal)
+    if per_industri and eps_est:
+        harga_per = round(per_industri * eps_est, 2)
+        results.append({
+            "Skenario":    "🏭 Rerata PER Industri",
+            "Batas Atas":  harga_per,
+            "Batas Bawah": harga_per,
+            "_note":       f"PER Industri={per_industri:.1f}x × EPS Est. ({fmt_rp(eps_est)})",
+        })
+    else:
+        results.append({"Skenario": "🏭 Rerata PER Industri", "Batas Atas": None, "Batas Bawah": None, "_note": "Isi PER Industri"})
+
+    # ── 5. Rerata PBV Industri ───────────────────────────────────────────────
+    # Nilai estimasi = PBV Industri × BVPS saat ini  (satu nilai tunggal)
+    if pbv_industri and bvps_current and bvps_current > 0:
+        harga_pbv = round(pbv_industri * bvps_current, 2)
+        results.append({
+            "Skenario":    "📖 Rerata PBV Industri",
+            "Batas Atas":  harga_pbv,
+            "Batas Bawah": harga_pbv,
+            "_note":       f"PBV Industri={pbv_industri:.2f}x × BVPS ({fmt_rp(bvps_current)})",
+        })
+    else:
+        results.append({"Skenario": "📖 Rerata PBV Industri", "Batas Atas": None, "Batas Bawah": None, "_note": "Isi PBV Industri & BVPS"})
+
+    return pd.DataFrame(results)
+
+
+# ============================================================
+# CHART
+# ============================================================
+def build_range_chart(scenarios_df: pd.DataFrame, current_price: float | None) -> go.Figure:
+    valid = scenarios_df[scenarios_df["Batas Atas"].notna() & scenarios_df["Batas Bawah"].notna()]
+    if valid.empty:
+        return None
+
+    labels = valid["Skenario"].tolist()
+    highs  = valid["Batas Atas"].tolist()
+    lows   = valid["Batas Bawah"].tolist()
+
+    fig = go.Figure()
+
+    colors = ["#e74c3c", "#2980b9", "#27ae60", "#8e44ad"]
+    for i, (label, h, l) in enumerate(zip(labels, highs, lows)):
+        color = colors[i % len(colors)]
+        fig.add_trace(go.Bar(
+            name=label,
+            x=[label],
+            y=[h - l],
+            base=[l],
+            marker_color=color,
+            opacity=0.75,
+            text=[f"{fmt_rp_short(l)} – {fmt_rp_short(h)}"],
+            textposition="outside" if h == l else "inside",
+            hovertemplate=f"<b>{label}</b><br>Batas Atas: {fmt_rp_short(h)}<br>Batas Bawah: {fmt_rp_short(l)}<extra></extra>",
+        ))
+
+    if current_price:
+        fig.add_hline(
+            y=current_price,
+            line_dash="dash",
+            line_color="black",
+            annotation_text=f"Harga Saat Ini: {fmt_rp_short(current_price)}",
+            annotation_position="top right",
         )
-        st.write("")
 
-        # Metric cards
-        m1, m2, m3, m4 = st.columns(4)
-        fv = calc.get("fv_combined", np.nan)
-        gl = calc.get("gl_pct", np.nan)
-        mos = calc.get("mos_pct", np.nan)
-        cagr = calc.get("cagr_pct", np.nan)
-        div_yield = calc.get("div_yield_pct", np.nan)
+    fig.update_layout(
+        title="Perkiraan Rentang Harga — Perbandingan Skenario",
+        yaxis_title="Harga (Rp)",
+        xaxis_title="",
+        showlegend=False,
+        height=420,
+        barmode="overlay",
+        plot_bgcolor="#f8f9fb",
+        paper_bgcolor="white",
+    )
+    return fig
 
-        m1.metric("💰 Harga Sekarang", fmt_currency(last_price, currency))
-        m2.metric(
-            f"🚀 Future Value ({projection_years}th)",
-            fmt_currency(fv, currency),
-            delta=fmt_pct(gl) if not np.isnan(gl) else None,
-        )
-        m3.metric(
-            "🛡️ Margin of Safety",
-            fmt_pct(mos) if not np.isnan(mos) else "—",
-        )
-        m4.metric(
-            "📈 CAGR Proyeksi",
-            fmt_pct(cagr) if not np.isnan(cagr) else "—",
-        )
 
-        # Secondary metrics
-        sm1, sm2, sm3 = st.columns(3)
-        sm1.metric("💸 Dividend Yield", fmt_pct(div_yield) if not np.isnan(div_yield) else "—")
-        sm2.metric("📦 Akum. Dividen (" + str(projection_years) + "th)",
-                   fmt_currency(calc.get("accumulated_dividend", np.nan), currency))
-        sm3.metric("🎯 FV tanpa Dividen",
-                   fmt_currency(calc.get("fv_combined_no_div", np.nan), currency))
+# ============================================================
+# PDF GENERATION
+# ============================================================
+def _strip_emoji(text: str) -> str:
+    """Remove non-ASCII characters (emoji) so reportlab Helvetica doesn't choke."""
+    return re.sub(r'[^\x00-\x7F]+', '', str(text)).strip()
 
-        # Composite growth rates
-        with st.expander("📐 Composite Growth Rates (detail kalkulasi)"):
-            cgc1, cgc2, cgc3 = st.columns(3)
-            cgc1.metric("Composite ROE", fmt_pct(calc.get("composite_roe", np.nan) * 100, 2))
-            cgc2.metric("Composite EPS Growth", fmt_pct(calc.get("composite_eps_gr", np.nan) * 100, 2))
-            cgc3.metric("Composite SPS Growth", fmt_pct(calc.get("composite_sps_gr", np.nan) * 100, 2))
 
-        # ── Projection Table ───────────────────────────────────────────────────
-        st.markdown("### 📅 Tabel Proyeksi Tahunan")
-        table = calc.get("projection_table", [])
-        if table:
-            df_table = pd.DataFrame(table)
-            df_display = pd.DataFrame({
-                "Tahun": df_table["year"],
-                "BV Proyeksi": df_table["bv_fv"].map(lambda x: fmt_num(x, 2)),
-                "EPS Proyeksi": df_table["eps_fv"].map(lambda x: fmt_num(x, 4)),
-                "SPS Proyeksi": df_table["sps_fv"].map(lambda x: fmt_num(x, 2)),
-                f"Harga via BV": df_table["fp_bv"].map(lambda x: fmt_currency(x, currency, 0)),
-                f"Harga via EPS": df_table["fp_eps"].map(lambda x: fmt_currency(x, currency, 0)),
-                f"Harga via SPS": df_table["fp_sps"].map(lambda x: fmt_currency(x, currency, 0)),
-                "FV Gabungan": df_table["fv_combined_no_div"].map(lambda x: fmt_currency(x, currency, 0)),
-                "Akum. Dividen": df_table["div_accumulated"].map(lambda x: fmt_currency(x, currency, 0)),
-                "FV + Dividen": df_table["fv_combined"].map(lambda x: fmt_currency(x, currency, 0)),
-            })
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
-
-        # ── Charts ─────────────────────────────────────────────────────────────
-        st.markdown("### 📉 Grafik Proyeksi Harga")
-        if table:
-            df_chart = pd.DataFrame(table)
-            from datetime import datetime
-            current_year = datetime.now().year
-
-            # Add current year as base row
-            base_row = {
-                "year": current_year,
-                "fp_bv": last_price,
-                "fp_eps": last_price,
-                "fp_sps": last_price,
-                "fv_combined_no_div": last_price,
-                "fv_combined": last_price,
-            }
-            years = [current_year] + list(df_chart["year"])
-            fp_bv_vals = [last_price] + list(df_chart["fp_bv"])
-            fp_eps_vals = [last_price] + list(df_chart["fp_eps"])
-            fp_sps_vals = [last_price] + list(df_chart["fp_sps"])
-            fv_vals = [last_price] + list(df_chart["fv_combined_no_div"])
-            fv_div_vals = [last_price] + list(df_chart["fv_combined"])
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=years, y=fp_bv_vals, mode="lines+markers",
-                                     name="Via BV", line=dict(color="#2196F3", dash="dot")))
-            fig.add_trace(go.Scatter(x=years, y=fp_eps_vals, mode="lines+markers",
-                                     name="Via EPS", line=dict(color="#4CAF50", dash="dot")))
-            fig.add_trace(go.Scatter(x=years, y=fp_sps_vals, mode="lines+markers",
-                                     name="Via SPS", line=dict(color="#FF9800", dash="dot")))
-            fig.add_trace(go.Scatter(x=years, y=fv_vals, mode="lines+markers",
-                                     name="FV Gabungan", line=dict(color="#9C27B0", width=2)))
-            fig.add_trace(go.Scatter(x=years, y=fv_div_vals, mode="lines+markers",
-                                     name="FV + Dividen", line=dict(color="#F44336", width=3)))
-            fig.add_hline(y=last_price, line_dash="dash", line_color="gray",
-                          annotation_text="Harga Sekarang")
-
-            y_label = "Harga (Rp)" if currency == "IDR" else "Price ($)"
-            fig.update_layout(
-                xaxis_title="Tahun",
-                yaxis_title=y_label,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                hovermode="x unified",
-                height=420,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        # Donut chart — weight breakdown
-        st.markdown("### 🍩 Bobot Komponen Future Value")
-        if total_w > 0:
-            fig_donut = px.pie(
-                values=[w_bv, w_eps, w_sps],
-                names=["Book Value (BV)", "Earnings (EPS)", "Sales (SPS)"],
-                hole=0.4,
-                color_discrete_sequence=["#2196F3", "#4CAF50", "#FF9800"],
-            )
-            fig_donut.update_layout(height=320)
-            st.plotly_chart(fig_donut, use_container_width=True)
-
-    # ── Disclaimer ─────────────────────────────────────────────────────────────
-    st.divider()
-    st.caption(
-        "⚠️ **Disclaimer:** Analisis ini hanya untuk tujuan referensi dan edukasi, "
-        "bukan merupakan rekomendasi investasi. Nilai investasi dapat naik dan turun. "
-        "Selalu lakukan riset mandiri (DYOR) sebelum membuat keputusan investasi."
+def generate_pdf(
+    data: dict,
+    hist_df: pd.DataFrame,
+    scenarios_df: pd.DataFrame,
+    eps_estimated: float,
+    bvps_input: float,
+    per_industri: float,
+    pbv_industri: float,
+    cagr: float | None,
+    cp: float | None,
+    fig: go.Figure | None,
+) -> bytes:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (
+        SimpleDocTemplate, Table, TableStyle,
+        Paragraph, Spacer, Image, HRFlowable,
     )
 
-    # ── Reset button ────────────────────────────────────────────────────────────
+    NAVY  = colors.HexColor('#1a5276')
+    GRAY  = colors.HexColor('#cccccc')
+    LIGHT = colors.HexColor('#f0f4f8')
+    GREEN = colors.HexColor('#1e8449')
+    RED   = colors.HexColor('#c0392b')
+
+    buffer = BytesIO()
+    W_PAGE, _ = A4
+    MARGIN = 2 * cm
+    W = W_PAGE - 2 * MARGIN
+
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        rightMargin=MARGIN, leftMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=MARGIN,
+    )
+
+    base  = getSampleStyleSheet()
+    title_s   = ParagraphStyle('t', parent=base['Title'],   fontSize=15, textColor=NAVY, spaceAfter=2)
+    heading_s = ParagraphStyle('h', parent=base['Heading2'], fontSize=10, textColor=NAVY, spaceAfter=3, spaceBefore=8)
+    normal_s  = base['Normal']
+    small_s   = ParagraphStyle('s', parent=base['Normal'],  fontSize=7.5, textColor=colors.grey)
+
+    def tbl_style(extra=None):
+        cmds = [
+            ('BACKGROUND',   (0, 0), (-1, 0),  NAVY),
+            ('TEXTCOLOR',    (0, 0), (-1, 0),  colors.white),
+            ('FONTNAME',     (0, 0), (-1, 0),  'Helvetica-Bold'),
+            ('FONTSIZE',     (0, 0), (-1, -1), 8.5),
+            ('ALIGN',        (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN',       (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID',         (0, 0), (-1, -1), 0.4, GRAY),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, LIGHT]),
+            ('TOPPADDING',   (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING',(0, 0), (-1, -1), 5),
+        ]
+        if extra:
+            cmds.extend(extra)
+        return TableStyle(cmds)
+
+    story = []
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    sub = f" · {data['sector']} / {data['industry']}" if data.get('sector') else ''
+    story.append(Paragraph("Perkiraan Rentang Harga Saham (PRHS)", title_s))
+    story.append(Paragraph(f"<b>{data['company_name']}</b>{sub}", normal_s))
+    story.append(Paragraph(
+        f"Tanggal analisis: {datetime.now().strftime('%d %B %Y')}  ·  Data: Yahoo Finance / IDX",
+        small_s,
+    ))
+    story.append(HRFlowable(width=W, thickness=1, color=NAVY, spaceAfter=6))
+
+    # ── Key Metrics ───────────────────────────────────────────────────────────
+    story.append(Paragraph("Metrik Utama", heading_s))
+    eps_v = data['current_eps']
+    bv_v  = data['current_bvps']
+    met_data = [
+        ["Harga Saat Ini", "EPS (TTM)", "BVPS", "PER Saat Ini", "PBV Saat Ini"],
+        [
+            fmt_rp_short(cp)  if cp  else "N/A",
+            fmt_rp(eps_v)     if eps_v else "N/A",
+            fmt_rp(bv_v)      if bv_v  else "N/A",
+            f"{cp/eps_v:.2f}x" if (cp and eps_v and eps_v > 0) else "N/A",
+            f"{cp/bv_v:.2f}x"  if (cp and bv_v  and bv_v  > 0) else "N/A",
+        ],
+    ]
+    story.append(Table(met_data, colWidths=[W/5]*5, style=tbl_style()))
+    story.append(Spacer(1, 0.3*cm))
+
+    # ── Historical Data ───────────────────────────────────────────────────────
+    story.append(Paragraph("Data Historis 5 Tahun Terakhir", heading_s))
+    hist_headers = ["Tahun", "H. Tertinggi", "H. Terendah", "EPS", "BVPS",
+                    "PER Tert.", "PER Ter.", "PBV Tert.", "PBV Ter."]
+    hist_rows = [hist_headers]
+    for _, row in hist_df.iterrows():
+        hist_rows.append([
+            str(int(row["Tahun"])),
+            fmt_rp_short(row["Harga Tertinggi"]) if pd.notna(row["Harga Tertinggi"]) else "N/A",
+            fmt_rp_short(row["Harga Terendah"])  if pd.notna(row["Harga Terendah"])  else "N/A",
+            fmt_rp(row["EPS"])  if pd.notna(row["EPS"])  else "N/A",
+            fmt_rp(row["BVPS"]) if pd.notna(row["BVPS"]) else "N/A",
+            f"{row['PER Tertinggi']:.2f}x" if pd.notna(row["PER Tertinggi"]) else "N/A",
+            f"{row['PER Terendah']:.2f}x"  if pd.notna(row["PER Terendah"])  else "N/A",
+            f"{row['PBV Tertinggi']:.2f}x" if pd.notna(row["PBV Tertinggi"]) else "N/A",
+            f"{row['PBV Terendah']:.2f}x"  if pd.notna(row["PBV Terendah"])  else "N/A",
+        ])
+    cw = W / len(hist_headers)
+    story.append(Table(hist_rows, colWidths=[cw]*len(hist_headers), style=tbl_style()))
+    story.append(Spacer(1, 0.3*cm))
+
+    # ── Parameters ───────────────────────────────────────────────────────────
+    story.append(Paragraph("Parameter Estimasi", heading_s))
+    cagr_str = f"{cagr*100:.1f}% / tahun" if cagr is not None else "N/A"
+    par_data = [
+        ["Parameter", "Nilai"],
+        ["CAGR EPS Historis", cagr_str],
+        ["EPS Estimasi Tahun Depan", fmt_rp(eps_estimated)],
+        ["BVPS Saat Ini (input)", fmt_rp(bvps_input)],
+        ["Rata-rata P/E Ratio Industri", f"{per_industri:.2f}x" if per_industri > 0 else "Tidak diisi"],
+        ["Price to BV Industri",         f"{pbv_industri:.2f}x" if pbv_industri > 0 else "Tidak diisi"],
+    ]
+    story.append(Table(par_data, colWidths=[W*0.55, W*0.45], style=tbl_style()))
+    story.append(Spacer(1, 0.3*cm))
+
+    # ── Scenarios ────────────────────────────────────────────────────────────
+    story.append(Paragraph(f"Perkiraan Rentang Harga — Tahun {datetime.now().year + 1}", heading_s))
+    scen_rows = [["Skenario", "Batas Atas (Rp)", "Batas Bawah (Rp)", "Formula / Keterangan"]]
+    for _, row in scenarios_df.iterrows():
+        ba = row["Batas Atas"]
+        bb = row["Batas Bawah"]
+        scen_rows.append([
+            _strip_emoji(row["Skenario"]),
+            fmt_rp_short(ba) if (ba is not None and pd.notna(ba)) else "N/A",
+            fmt_rp_short(bb) if (bb is not None and pd.notna(bb)) else "N/A",
+            str(row.get("_note", "")),
+        ])
+    story.append(Table(
+        scen_rows,
+        colWidths=[W*0.22, W*0.17, W*0.17, W*0.44],
+        style=tbl_style(extra=[('ALIGN', (0, 1), (0, -1), 'LEFT'),
+                                ('ALIGN', (3, 1), (3, -1), 'LEFT'),
+                                ('FONTSIZE', (3, 1), (3, -1), 7.5)]),
+    ))
+    story.append(Spacer(1, 0.3*cm))
+
+    # ── MoS ──────────────────────────────────────────────────────────────────
+    netral_row = scenarios_df[scenarios_df["Skenario"].str.contains("Netral")]
+    if not netral_row.empty and cp:
+        nu = netral_row.iloc[0]["Batas Atas"]
+        nl = netral_row.iloc[0]["Batas Bawah"]
+        if nu is not None and pd.notna(nu):
+            mos_u = (nu - cp) / nu * 100
+            mos_l = (nl - cp) / nl * 100 if (nl is not None and pd.notna(nl) and nl != 0) else None
+            story.append(Paragraph("Margin of Safety (MoS) — Estimasi Netral", heading_s))
+            mos_data = [["Harga Saat Ini", "MoS dari Batas Atas Netral", "MoS dari Batas Bawah Netral"]]
+            mos_data.append([
+                fmt_rp_short(cp),
+                f"{mos_u:.1f}% ({'Undervalued' if mos_u > 0 else 'Overvalued'})",
+                f"{mos_l:.1f}% ({'Undervalued' if mos_l > 0 else 'Overvalued'})" if mos_l is not None else "N/A",
+            ])
+            extra_mos = [
+                ('TEXTCOLOR', (1, 1), (1, 1), GREEN if mos_u > 0 else RED),
+                ('TEXTCOLOR', (2, 1), (2, 1), (GREEN if mos_l > 0 else RED) if mos_l is not None else colors.grey),
+                ('FONTNAME',  (1, 1), (2, 1), 'Helvetica-Bold'),
+            ]
+            story.append(Table(mos_data, colWidths=[W/3]*3, style=tbl_style(extra=extra_mos)))
+            story.append(Spacer(1, 0.3*cm))
+
+    # ── Chart ─────────────────────────────────────────────────────────────────
+    if fig is not None:
+        try:
+            import plotly.io as pio
+            img_bytes = pio.to_image(fig, format="png", width=750, height=380, scale=1.5)
+            chart_img = Image(BytesIO(img_bytes), width=W, height=W * 0.5)
+            story.append(Paragraph("Visualisasi Rentang Harga", heading_s))
+            story.append(chart_img)
+            story.append(Spacer(1, 0.3*cm))
+        except Exception:
+            pass  # kaleido not installed — skip chart
+
+    # ── Disclaimer ───────────────────────────────────────────────────────────
+    story.append(HRFlowable(width=W, thickness=0.5, color=GRAY, spaceAfter=4))
+    story.append(Paragraph(
+        "Dokumen ini dibuat otomatis oleh PRHS App. Bukan merupakan rekomendasi investasi. "
+        "Data bersumber dari Yahoo Finance dan dapat berbeda dengan data IDX resmi.",
+        small_s,
+    ))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+# ============================================================
+# MAIN APP
+# ============================================================
+st.title("📈 Perkiraan Rentang Harga Saham (PRHS)")
+st.markdown(
+    "**Humanis PRHS** — Estimasi harga saham tahun depan berdasarkan data historis 5 tahun | "
+    "Data otomatis dari Yahoo Finance · IDX"
+)
+st.divider()
+
+# ── Input ─────────────────────────────────────────────────────────────────
+col_a, col_b, _ = st.columns([3, 1, 3])  # third column is intentional whitespace
+with col_a:
+    ticker_raw = st.text_input(
+        "Kode Saham",
+        placeholder="Contoh: BBCA  /  TLKM  /  BBRI",
+        help="Kode saham IDX. Suffix .JK ditambahkan otomatis.",
+        key="ticker_input",
+    )
+with col_b:
+    st.write("")
+    st.write("")
+    fetch_btn = st.button("🔍 Ambil Data", type="primary", use_container_width=True)
+
+# ── Session State ─────────────────────────────────────────────────────────
+if "data" not in st.session_state:
+    st.session_state.data     = None
+    st.session_state.hist_df  = None
+    st.session_state.symbol   = None
+
+if fetch_btn and ticker_raw.strip():
+    symbol = normalize_ticker(ticker_raw)
+    with st.spinner(f"Mengambil data {symbol} …"):
+        try:
+            data = fetch_stock_data(symbol)
+            hist_df = build_hist_table(
+                data["annual_prices"],
+                data["eps_by_year"],
+                data["bvps_by_year"],
+            )
+            st.session_state.data    = data
+            st.session_state.hist_df = hist_df
+            st.session_state.symbol  = symbol
+            st.success(f"✅ Data **{data['company_name']}** berhasil diambil!")
+        except Exception as e:
+            st.error(f"❌ {e}")
+            st.session_state.data = None
+
+# ── Display ────────────────────────────────────────────────────────────────
+if st.session_state.data is not None:
+    data    = st.session_state.data
+    hist_df = st.session_state.hist_df.copy()
+
+    # Company header
+    sub = f" · {data['sector']} / {data['industry']}" if data.get("sector") else ""
+    st.subheader(f"📊 {data['company_name']}{sub}")
+
+    # Key metrics
+    m1, m2, m3, m4, m5 = st.columns(5)
+    cp  = data["current_price"]
+    eps = data["current_eps"]
+    bv  = data["current_bvps"]
+
+    m1.metric("Harga Saat Ini",  fmt_rp_short(cp)  if cp  else "N/A")
+    m2.metric("EPS (TTM)",       fmt_rp(eps)        if eps else "N/A")
+    m3.metric("BVPS",            fmt_rp(bv)         if bv  else "N/A")
+    m4.metric("PER Saat Ini",    f"{cp/eps:.2f}x"   if (cp and eps and eps > 0) else "N/A")
+    m5.metric("PBV Saat Ini",    f"{cp/bv:.2f}x"    if (cp and bv  and bv  > 0) else "N/A")
+
     st.divider()
-    if st.button("🔄 Reset — Analisis Saham Baru", use_container_width=True):
-        st.session_state.fetched = {}
-        st.session_state.overrides = {}
-        st.session_state.current_ticker = ""
-        st.session_state.reset_count += 1
+
+    # ── Historical Data Table (Editable) ─────────────────────────────────
+    st.subheader("📅 Data Historis 5 Tahun Terakhir")
+    st.caption(
+        "💡 EPS dan BVPS diambil otomatis dari laporan keuangan. "
+        "Anda dapat mengedit nilainya jika data belum tersedia atau perlu koreksi."
+    )
+
+    edited_df = st.data_editor(
+        hist_df,
+        column_config={
+            "Tahun":           st.column_config.NumberColumn("Tahun", disabled=True, format="%d"),
+            "Harga Tertinggi": st.column_config.NumberColumn("Harga Tertinggi (Rp)", format="%.0f", disabled=True),
+            "Harga Terendah":  st.column_config.NumberColumn("Harga Terendah (Rp)",  format="%.0f", disabled=True),
+            "EPS":             st.column_config.NumberColumn("EPS ✏️",   format="%.2f", help="Earnings Per Share — edit jika perlu"),
+            "BVPS":            st.column_config.NumberColumn("BVPS ✏️",  format="%.2f", help="Book Value Per Share — edit jika perlu"),
+            "PER Tertinggi":   st.column_config.NumberColumn("PER Tertinggi", format="%.2f", disabled=True),
+            "PER Terendah":    st.column_config.NumberColumn("PER Terendah",  format="%.2f", disabled=True),
+            "PBV Tertinggi":   st.column_config.NumberColumn("PBV Tertinggi", format="%.2f", disabled=True),
+            "PBV Terendah":    st.column_config.NumberColumn("PBV Terendah",  format="%.2f", disabled=True),
+        },
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key="hist_editor",
+    )
+
+    # Recalculate derived columns after any edit
+    edited_df = recalc_derived(edited_df)
+
+    # ── Peringatan EPS negatif ─────────────────────────────────────────────
+    neg_eps_years = [
+        int(row["Tahun"]) for _, row in edited_df.iterrows()
+        if pd.notna(row["EPS"]) and row["EPS"] < 0
+    ]
+    if neg_eps_years:
+        years_str = ", ".join(str(y) for y in sorted(neg_eps_years))
+        st.warning(
+            f"⚠️ **EPS Negatif Terdeteksi** — tahun: **{years_str}**\n\n"
+            "Metode PRHS mengasumsikan EPS selalu positif. "
+            "Tahun dengan EPS negatif **dikecualikan** dari perhitungan CAGR dan skenario harga. "
+            "Hasil estimasi mungkin **kurang akurat** — pertimbangkan untuk memverifikasi "
+            "data dari laporan keuangan resmi di IDX.co.id."
+        )
+
+    st.divider()
+
+    # ── Parameters ────────────────────────────────────────────────────────
+    st.subheader("⚙️ Parameter Estimasi")
+
+    eps_hist = {
+        int(row["Tahun"]): row["EPS"]
+        for _, row in edited_df.iterrows()
+        if pd.notna(row["EPS"]) and row["EPS"] > 0
+    }
+    cagr, eps_auto = estimate_eps_growth(eps_hist)
+    latest_eps = None
+    if eps_hist:
+        latest_year = max(eps_hist.keys())
+        latest_eps  = eps_hist[latest_year]
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown("**EPS & BVPS**")
+        if cagr is not None and eps_auto is not None:
+            st.info(
+                f"📈 CAGR EPS historis: **{cagr*100:.1f}% / tahun**  |  "
+                f"EPS terakhir: **{fmt_rp(latest_eps)}**  →  "
+                f"EPS est. otomatis: **{fmt_rp(eps_auto)}**"
+            )
+        else:
+            st.warning("⚠️ Data EPS historis tidak lengkap — masukkan EPS estimated secara manual.")
+
+        eps_estimated = st.number_input(
+            "EPS Estimasi Tahun Depan (Rp) ✏️",
+            min_value=0.0,
+            value=float(round(eps_auto, 2)) if eps_auto and eps_auto > 0 else 0.0,
+            step=10.0,
+            format="%.2f",
+            help="Dihitung otomatis dengan CAGR historis. Anda bisa mengubahnya.",
+        )
+
+        bvps_input = st.number_input(
+            "BVPS Saat Ini (Rp) ✏️",
+            min_value=0.0,
+            value=float(round(data["current_bvps"], 2)) if data["current_bvps"] else 0.0,
+            step=10.0,
+            format="%.2f",
+            help="Book Value Per Share dari laporan keuangan terakhir.",
+        )
+
+    with col_right:
+        st.markdown(
+            "**Data Industri**  "
+            "*(IDX.co.id → Data Pasar → Laporan Statistik → Digital Statistik → "
+            "Summary Financial Ratio by Industry)*"
+        )
+        st.markdown('<p style="color:red; font-weight:600; margin-bottom:0;">Rata-rata P/E Ratio Industri ✏️</p>', unsafe_allow_html=True)
+        per_industri = st.number_input(
+            "Rata-rata P/E Ratio Industri",
+            min_value=0.0,
+            value=0.0,
+            step=0.5,
+            format="%.2f",
+            help="Price/Earnings Ratio rata-rata industri. Isi manual dari IDX.",
+            label_visibility="collapsed",
+        )
+        st.markdown('<p style="color:red; font-weight:600; margin-bottom:0;">Price to BV Industri ✏️</p>', unsafe_allow_html=True)
+        pbv_industri = st.number_input(
+            "Price to BV Industri",
+            min_value=0.0,
+            value=0.0,
+            step=0.1,
+            format="%.2f",
+            help="Price/Book Value rata-rata industri. Isi manual dari IDX.",
+            label_visibility="collapsed",
+        )
+
+    st.divider()
+
+    # ── Output Table ──────────────────────────────────────────────────────
+    st.subheader(f"🎯 Perkiraan Rentang Harga Saham — Tahun {datetime.now().year + 1}")
+
+    if eps_estimated > 0:
+        scenarios_df = calculate_scenarios(
+            df=edited_df,
+            eps_est=eps_estimated,
+            bvps_current=bvps_input if bvps_input > 0 else None,
+            per_industri=per_industri if per_industri > 0 else None,
+            pbv_industri=pbv_industri if pbv_industri > 0 else None,
+        )
+
+        # ── Table display
+        display_df = scenarios_df.copy()
+        display_df["Batas Atas (Rp)"]  = display_df["Batas Atas"].apply(fmt_rp_short)
+        display_df["Batas Bawah (Rp)"] = display_df["Batas Bawah"].apply(fmt_rp_short)
+        display_df["Formula / Keterangan"] = display_df["_note"]
+
+        st.dataframe(
+            display_df[["Skenario", "Batas Atas (Rp)", "Batas Bawah (Rp)", "Formula / Keterangan"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # ── MoS section
+        netral_row = scenarios_df[scenarios_df["Skenario"].str.contains("Netral")]
+        if not netral_row.empty:
+            netral_upper = netral_row.iloc[0]["Batas Atas"]
+            netral_lower = netral_row.iloc[0]["Batas Bawah"]
+            if cp and netral_upper is not None and pd.notna(netral_upper):
+                mos_upper = (netral_upper - cp) / netral_upper * 100
+                mos_lower = (netral_lower - cp) / netral_lower * 100 if (netral_lower is not None and pd.notna(netral_lower) and netral_lower != 0) else None
+
+                mos_col1, mos_col2, mos_col3 = st.columns(3)
+                mos_col1.metric("Harga Saat Ini", fmt_rp_short(cp))
+                color_u = "normal" if mos_upper > 0 else "inverse"
+                mos_col2.metric(
+                    "MoS dari Batas Atas Netral",
+                    f"{mos_upper:.1f}%",
+                    delta=f"{'Undervalued' if mos_upper > 0 else 'Overvalued'}",
+                    delta_color=color_u,
+                )
+                if mos_lower is not None:
+                    color_l = "normal" if mos_lower > 0 else "inverse"
+                    mos_col3.metric(
+                        "MoS dari Batas Bawah Netral",
+                        f"{mos_lower:.1f}%",
+                        delta=f"{'Undervalued' if mos_lower > 0 else 'Overvalued'}",
+                        delta_color=color_l,
+                    )
+
+        # ── Chart
+        st.markdown("#### Visualisasi Rentang Harga")
+        fig = build_range_chart(scenarios_df, cp)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ── PDF Download ──────────────────────────────────────────────────────
+        st.divider()
+        ticker_clean = st.session_state.symbol.replace(".JK", "")
+        pdf_filename = f"{ticker_clean}_PRHS_{datetime.now().strftime('%Y%m%d')}.pdf"
+
+        # Auto-generate PDF ketika parameter berubah (cache by key)
+        pdf_cache_key = f"{st.session_state.symbol}|{eps_estimated}|{bvps_input}|{per_industri}|{pbv_industri}|{hash(edited_df.to_json())}"
+        if st.session_state.get("_pdf_key") != pdf_cache_key:
+            with st.spinner("Menyiapkan laporan PDF …"):
+                st.session_state._pdf_bytes = generate_pdf(
+                    data=data,
+                    hist_df=edited_df,
+                    scenarios_df=scenarios_df,
+                    eps_estimated=eps_estimated,
+                    bvps_input=bvps_input,
+                    per_industri=per_industri,
+                    pbv_industri=pbv_industri,
+                    cagr=cagr,
+                    cp=cp,
+                    fig=fig,
+                )
+                st.session_state._pdf_key = pdf_cache_key
+
+        st.download_button(
+            "⬇️ Download as PDF",
+            data=st.session_state._pdf_bytes,
+            file_name=pdf_filename,
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True,
+        )
+
+    else:
+        st.warning("⚠️ Masukkan **EPS Estimasi Tahun Depan** untuk menghitung perkiraan harga.")
+
+    # ── Footer notes
+    st.divider()
+    st.caption(
+        "📌 **Catatan:**  \n"
+        "- Valid hanya untuk saham dengan **EPS selalu positif** dalam 5 tahun terakhir.  \n"
+        "- Data harga historis dan EPS dari **Yahoo Finance** — dapat berbeda dengan data IDX resmi.  \n"
+        "- Untuk akurasi lebih tinggi, verifikasi EPS dari laporan keuangan di "
+        "[IDX.co.id](https://www.idx.co.id) atau [RTI.co.id](https://www.rti.co.id).  \n"
+        "- PER & PBV Industri: IDX.co.id → Data Pasar → Laporan Statistik → Digital Statistik → "
+        "Listed Company → Summary Financial Ratio by Industry.  \n"
+        "- Aplikasi ini **bukan merupakan rekomendasi investasi**."
+    )
+
+    # ── Reset Button ──────────────────────────────────────────────────────
+    st.divider()
+    if st.button("🔄 Reset — Mulai Analisis Baru", type="secondary", use_container_width=True):
+        for key in ["data", "hist_df", "symbol", "hist_editor", "_pdf_bytes", "_pdf_key"]:
+            st.session_state.pop(key, None)
+        st.session_state["ticker_input"] = ""
         st.rerun()
 
-elif not analyze_btn:
-    st.info("👆 Masukkan kode saham dan klik **Analisis** untuk memulai.")
+else:
+    # Landing state
+    st.info("👆 Masukkan kode saham IDX di atas (contoh: **BBCA**, **TLKM**, **BBRI**) lalu klik **Ambil Data**.")
+
+    with st.expander("ℹ️ Cara Menggunakan Aplikasi"):
+        st.markdown("""
+**Langkah-langkah:**
+1. **Masukkan kode saham** IDX (tanpa .JK) → klik *Ambil Data*
+2. **Periksa tabel historis** — edit EPS/BVPS jika data belum tersedia atau salah
+3. **Sesuaikan EPS Estimasi** tahun depan (otomatis dari CAGR, bisa diedit)
+4. **Isi PER & PBV Industri** dari IDX.co.id untuk skenario Rerata Industri
+5. **Baca tabel output** — 4 skenario perkiraan rentang harga
+
+**Formula per skenario:**
+| Skenario | Batas Atas | Batas Bawah |
+|---|---|---|
+| 🚀 Optimis | max(PER Tertinggi 5 thn) × EPS Est. | max(PER Terendah 5 thn) × EPS Est. |
+| ⚖️ Netral | avg(PER Tertinggi 5 thn) × EPS Est. | avg(PER Terendah 5 thn) × EPS Est. |
+| 📚 Rerata BV | avg(PBV Tertinggi 5 thn) × BVPS | avg(PBV Terendah 5 thn) × BVPS |
+| 🏭 Rerata PER Industri | PER Industri × EPS Est. | *(nilai tunggal)* |
+| 📖 Rerata PBV Industri | PBV Industri × BVPS | *(nilai tunggal)* |
+        """)
