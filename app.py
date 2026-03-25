@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime
 from io import BytesIO
 import re
+import time
 import plotly.graph_objects as go
 import warnings
 
@@ -75,11 +76,28 @@ def safe_get(d: dict, *keys, default=None):
 # ============================================================
 # DATA FETCHING
 # ============================================================
+def _yf_call(fn, retries=3):
+    """Panggil fungsi yfinance dengan retry + backoff saat rate limited."""
+    for attempt in range(retries):
+        try:
+            result = fn()
+            time.sleep(0.4)  # jeda sopan antar request
+            return result
+        except Exception as e:
+            msg = str(e).lower()
+            if "too many requests" in msg or "rate limit" in msg or "429" in msg:
+                if attempt < retries - 1:
+                    time.sleep(3 * (attempt + 1))  # 3s, 6s, 9s
+                    continue
+                raise ValueError("Yahoo Finance membatasi akses (rate limit). Tunggu beberapa saat lalu coba lagi.")
+            raise
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_stock_data(symbol: str) -> dict:
     ticker = yf.Ticker(symbol)
-    info = ticker.info
 
+    info = _yf_call(lambda: ticker.info)
     if not info or info.get("quoteType") in (None, "NONE", ""):
         raise ValueError(f"Saham '{symbol}' tidak ditemukan atau tidak tersedia di Yahoo Finance.")
 
@@ -92,7 +110,7 @@ def fetch_stock_data(symbol: str) -> dict:
     industry      = info.get("industry", "")
 
     # ---- Annual High / Low Prices (5 years) ----
-    hist = ticker.history(period="5y", interval="1d")
+    hist = _yf_call(lambda: ticker.history(period="5y", interval="1d"))
     annual_prices = []
     if not hist.empty:
         hist.index = pd.to_datetime(hist.index)
@@ -106,7 +124,7 @@ def fetch_stock_data(symbol: str) -> dict:
     # ---- Annual EPS from Financials ----
     eps_by_year: dict[int, float] = {}
     try:
-        fin = ticker.financials  # rows=metrics, cols=fiscal-year dates
+        fin = _yf_call(lambda: ticker.financials)
         ni_key = next(
             (k for k in ["Net Income", "Net Income Common Stockholders", "NetIncome"] if k in fin.index),
             None,
@@ -128,7 +146,7 @@ def fetch_stock_data(symbol: str) -> dict:
     # ---- Annual BVPS from Balance Sheet ----
     bvps_by_year: dict[int, float] = {}
     try:
-        bs = ticker.balance_sheet
+        bs = _yf_call(lambda: ticker.balance_sheet)
         eq_key = next(
             (k for k in ["Stockholders Equity", "Common Stock Equity", "Total Stockholder Equity"] if k in bs.index),
             None,
