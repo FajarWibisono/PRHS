@@ -37,6 +37,7 @@ st.markdown("""
         background-color: #1a5276 !important;
         color: white !important;
     }
+    [data-testid="stToolbarActions"] {display: none !important;}
 </style>
 """, unsafe_allow_html=True)
 
