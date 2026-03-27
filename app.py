@@ -93,25 +93,99 @@ def _yf_call(fn, retries=3):
             raise
 
 
+def _parse_financials(fin, shares: float, existing: dict) -> dict:
+    """Ekstrak EPS per tahun dari DataFrame financials yfinance."""
+    result = dict(existing)
+    if fin is None or (hasattr(fin, "empty") and fin.empty):
+        return result
+    ni_keys = ["Net Income", "Net Income Common Stockholders", "NetIncome",
+               "Net Income From Continuing Operations"]
+    ni_key = next((k for k in ni_keys if k in fin.index), None)
+    if not ni_key:
+        return result
+    ni = fin.loc[ni_key]
+    for col in ni.index:
+        try:
+            yr = pd.to_datetime(col).year
+        except Exception:
+            continue
+        val = ni[col]
+        if pd.notna(val) and yr not in result:
+            result[yr] = float(val) / shares
+    return result
+
+
+def _parse_balance_sheet(bs, shares: float, existing: dict) -> dict:
+    """Ekstrak BVPS per tahun dari DataFrame balance sheet yfinance."""
+    result = dict(existing)
+    if bs is None or (hasattr(bs, "empty") and bs.empty):
+        return result
+    eq_keys = [
+        "Stockholders Equity", "Common Stock Equity", "Total Stockholder Equity",
+        "Total Equity Gross Minority Interest", "Stockholders Equity (Net Minority Interest)",
+    ]
+    eq_key = next((k for k in eq_keys if k in bs.index), None)
+    if not eq_key:
+        return result
+    eq = bs.loc[eq_key]
+    for col in eq.index:
+        try:
+            yr = pd.to_datetime(col).year
+        except Exception:
+            continue
+        val = eq[col]
+        if pd.notna(val) and yr not in result:
+            result[yr] = float(val) / shares
+    return result
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_stock_data(symbol: str) -> dict:
     ticker = yf.Ticker(symbol)
 
-    info = _yf_call(lambda: ticker.info)
-    if not info or info.get("quoteType") in (None, "NONE", ""):
-        raise ValueError(f"Saham '{symbol}' tidak ditemukan atau tidak tersedia di Yahoo Finance.")
+    # --- Validasi primer via fast_info (ringan & reliable) ---
+    fast_price = None
+    fast_shares = None
+    try:
+        fast = _yf_call(lambda: ticker.fast_info)
+        fast_price  = getattr(fast, "last_price",  None)
+        fast_shares = getattr(fast, "shares",       None)
+    except Exception:
+        pass
 
-    company_name = safe_get(info, "longName", "shortName", default=symbol)
-    current_price = safe_get(info, "currentPrice", "regularMarketPrice", "previousClose")
+    # --- Full info (bisa lambat / kosong untuk saham tertentu) ---
+    try:
+        info = _yf_call(lambda: ticker.info)
+    except Exception:
+        info = {}
+    if not isinstance(info, dict):
+        info = {}
+
+    # Validasi: cukup punya harga ATAU nama perusahaan — jangan tolak cuma karena quoteType kosong
+    has_price = fast_price is not None or \
+        safe_get(info, "currentPrice", "regularMarketPrice", "previousClose") is not None
+    has_name  = safe_get(info, "longName", "shortName") is not None
+    if not has_price and not has_name:
+        raise ValueError(
+            f"Saham '{symbol}' tidak ditemukan atau tidak tersedia di Yahoo Finance, gagal mendapatkan data."
+        )
+
+    company_name  = safe_get(info, "longName", "shortName", default=symbol)
+    _cp           = safe_get(info, "currentPrice", "regularMarketPrice", "previousClose")
+    current_price = _cp if _cp is not None else fast_price
     current_eps   = safe_get(info, "trailingEps")
     current_bvps  = safe_get(info, "bookValue")
-    shares        = safe_get(info, "sharesOutstanding")
+    _sh           = safe_get(info, "sharesOutstanding")
+    shares        = _sh if _sh is not None else fast_shares
     sector        = info.get("sector", "")
     industry      = info.get("industry", "")
 
     # ---- Annual High / Low Prices (5 years) ----
-    hist = _yf_call(lambda: ticker.history(period="5y", interval="1d"))
     annual_prices = []
+    try:
+        hist = _yf_call(lambda: ticker.history(period="5y", interval="1d"))
+    except Exception:
+        hist = pd.DataFrame()
     if not hist.empty:
         hist.index = pd.to_datetime(hist.index)
         hist["Year"] = hist.index.year
@@ -121,47 +195,44 @@ def fetch_stock_data(symbol: str) -> dict:
         for yr, row in grp.iterrows():
             annual_prices.append({"Tahun": int(yr), "Harga Tertinggi": row["High"], "Harga Terendah": row["Low"]})
 
-    # ---- Annual EPS from Financials ----
+    # ---- Annual EPS — coba beberapa sumber secara berurutan ----
     eps_by_year: dict[int, float] = {}
-    try:
-        fin = _yf_call(lambda: ticker.financials)
-        ni_key = next(
-            (k for k in ["Net Income", "Net Income Common Stockholders", "NetIncome"] if k in fin.index),
-            None,
-        )
-        if ni_key and shares and shares > 0:
-            ni = fin.loc[ni_key]
-            for col in ni.index:
-                yr = pd.to_datetime(col).year
-                val = ni[col]
-                if pd.notna(val):
-                    eps_by_year[yr] = float(val) / shares
-    except Exception:
-        pass
+    if shares and shares > 0:
+        for fin_fn in [
+            lambda: ticker.financials,         # annual (API lama)
+            lambda: ticker.income_stmt,        # annual (API baru yfinance ≥ 0.2)
+            lambda: ticker.quarterly_financials,
+            lambda: ticker.quarterly_income_stmt,
+        ]:
+            try:
+                fin = _yf_call(fin_fn)
+                eps_by_year = _parse_financials(fin, shares, eps_by_year)
+                if len(eps_by_year) >= 2:
+                    break
+            except Exception:
+                continue
 
-    # Fallback: trailingEps as current year
-    if current_eps and datetime.now().year not in eps_by_year:
+    # Fallback: trailingEps sebagai tahun berjalan
+    if current_eps is not None and datetime.now().year not in eps_by_year:
         eps_by_year[datetime.now().year] = float(current_eps)
 
-    # ---- Annual BVPS from Balance Sheet ----
+    # ---- Annual BVPS — coba beberapa sumber secara berurutan ----
     bvps_by_year: dict[int, float] = {}
-    try:
-        bs = _yf_call(lambda: ticker.balance_sheet)
-        eq_key = next(
-            (k for k in ["Stockholders Equity", "Common Stock Equity", "Total Stockholder Equity"] if k in bs.index),
-            None,
-        )
-        if eq_key and shares and shares > 0:
-            eq = bs.loc[eq_key]
-            for col in eq.index:
-                yr = pd.to_datetime(col).year
-                val = eq[col]
-                if pd.notna(val):
-                    bvps_by_year[yr] = float(val) / shares
-    except Exception:
-        pass
+    if shares and shares > 0:
+        for bs_fn in [
+            lambda: ticker.balance_sheet,          # annual (API lama)
+            lambda: ticker.get_balance_sheet(),    # annual (API baru)
+            lambda: ticker.quarterly_balance_sheet,
+        ]:
+            try:
+                bs = _yf_call(bs_fn)
+                bvps_by_year = _parse_balance_sheet(bs, shares, bvps_by_year)
+                if len(bvps_by_year) >= 2:
+                    break
+            except Exception:
+                continue
 
-    if current_bvps and datetime.now().year not in bvps_by_year:
+    if current_bvps is not None and datetime.now().year not in bvps_by_year:
         bvps_by_year[datetime.now().year] = float(current_bvps)
 
     return {
@@ -211,15 +282,12 @@ def build_hist_table(annual_prices: list, eps_by_year: dict, bvps_by_year: dict)
 
 def recalc_derived(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for i, row in df.iterrows():
-        eps  = row["EPS"]
-        bvps = row["BVPS"]
-        high = row["Harga Tertinggi"]
-        low  = row["Harga Terendah"]
-        df.at[i, "PER Tertinggi"] = high / eps  if (pd.notna(eps)  and eps  > 0) else np.nan
-        df.at[i, "PER Terendah"]  = low  / eps  if (pd.notna(eps)  and eps  > 0) else np.nan
-        df.at[i, "PBV Tertinggi"] = high / bvps if (pd.notna(bvps) and bvps > 0) else np.nan
-        df.at[i, "PBV Terendah"]  = low  / bvps if (pd.notna(bvps) and bvps > 0) else np.nan
+    eps_safe  = df["EPS"].where(df["EPS"].notna()  & (df["EPS"]  > 0))
+    bvps_safe = df["BVPS"].where(df["BVPS"].notna() & (df["BVPS"] > 0))
+    df["PER Tertinggi"] = df["Harga Tertinggi"] / eps_safe
+    df["PER Terendah"]  = df["Harga Terendah"]  / eps_safe
+    df["PBV Tertinggi"] = df["Harga Tertinggi"] / bvps_safe
+    df["PBV Terendah"]  = df["Harga Terendah"]  / bvps_safe
     return df
 
 
@@ -470,11 +538,11 @@ def generate_pdf(
     met_data = [
         ["Harga Saat Ini", "EPS (TTM)", "BVPS", "PER Saat Ini", "PBV Saat Ini"],
         [
-            fmt_rp_short(cp)  if cp  else "N/A",
-            fmt_rp(eps_v)     if eps_v else "N/A",
-            fmt_rp(bv_v)      if bv_v  else "N/A",
-            f"{cp/eps_v:.2f}x" if (cp and eps_v and eps_v > 0) else "N/A",
-            f"{cp/bv_v:.2f}x"  if (cp and bv_v  and bv_v  > 0) else "N/A",
+            fmt_rp_short(cp)   if cp  is not None else "N/A",
+            fmt_rp(eps_v)      if eps_v is not None else "N/A",
+            fmt_rp(bv_v)       if bv_v  is not None else "N/A",
+            f"{cp/eps_v:.2f}x" if (cp is not None and eps_v is not None and eps_v > 0) else "N/A",
+            f"{cp/bv_v:.2f}x"  if (cp is not None and bv_v  is not None and bv_v  > 0) else "N/A",
         ],
     ]
     story.append(Table(met_data, colWidths=[W/5]*5, style=tbl_style()))
@@ -538,12 +606,12 @@ def generate_pdf(
 
     # ── MoS ──────────────────────────────────────────────────────────────────
     netral_row = scenarios_df[scenarios_df["Skenario"].str.contains("Netral")]
-    if not netral_row.empty and cp:
+    if not netral_row.empty and cp is not None:
         nu = netral_row.iloc[0]["Batas Atas"]
         nl = netral_row.iloc[0]["Batas Bawah"]
         if nu is not None and pd.notna(nu):
             mos_u = (nu - cp) / nu * 100
-            mos_l = (nl - cp) / nl * 100 if (nl is not None and pd.notna(nl) and nl != 0) else None
+            mos_l = (nl - cp) / nl * 100 if (nl is not None and nl != 0) else None
             story.append(Paragraph("Margin of Safety (MoS) — Estimasi Netral", heading_s))
             mos_data = [["Harga Saat Ini", "MoS dari Batas Atas Netral", "MoS dari Batas Bawah Netral"]]
             mos_data.append([
@@ -646,11 +714,11 @@ if st.session_state.data is not None:
     eps = data["current_eps"]
     bv  = data["current_bvps"]
 
-    m1.metric("Harga Saat Ini",  fmt_rp_short(cp)  if cp  else "N/A")
-    m2.metric("EPS (TTM)",       fmt_rp(eps)        if eps else "N/A")
-    m3.metric("BVPS",            fmt_rp(bv)         if bv  else "N/A")
-    m4.metric("PER Saat Ini",    f"{cp/eps:.2f}x"   if (cp and eps and eps > 0) else "N/A")
-    m5.metric("PBV Saat Ini",    f"{cp/bv:.2f}x"    if (cp and bv  and bv  > 0) else "N/A")
+    m1.metric("Harga Saat Ini",  fmt_rp_short(cp)   if cp  is not None else "N/A")
+    m2.metric("EPS (TTM)",       fmt_rp(eps)         if eps is not None else "N/A")
+    m3.metric("BVPS",            fmt_rp(bv)          if bv  is not None else "N/A")
+    m4.metric("PER Saat Ini",    f"{cp/eps:.2f}x"    if (cp is not None and eps is not None and eps > 0) else "N/A")
+    m5.metric("PBV Saat Ini",    f"{cp/bv:.2f}x"     if (cp is not None and bv  is not None and bv  > 0) else "N/A")
 
     st.divider()
 
@@ -730,7 +798,7 @@ if st.session_state.data is not None:
         eps_estimated = st.number_input(
             "EPS Estimasi Tahun Depan (Rp) ✏️",
             min_value=0.0,
-            value=float(round(eps_auto, 2)) if eps_auto and eps_auto > 0 else 0.0,
+            value=float(round(eps_auto, 2)) if (eps_auto is not None and eps_auto > 0) else 0.0,
             step=10.0,
             format="%.2f",
             help="Dihitung otomatis dengan CAGR historis. Anda bisa mengubahnya.",
@@ -739,7 +807,7 @@ if st.session_state.data is not None:
         bvps_input = st.number_input(
             "BVPS Saat Ini (Rp) ✏️",
             min_value=0.0,
-            value=float(round(data["current_bvps"], 2)) if data["current_bvps"] else 0.0,
+            value=float(round(data["current_bvps"], 2)) if data["current_bvps"] is not None else 0.0,
             step=10.0,
             format="%.2f",
             help="Book Value Per Share dari laporan keuangan terakhir.",
@@ -803,9 +871,9 @@ if st.session_state.data is not None:
         if not netral_row.empty:
             netral_upper = netral_row.iloc[0]["Batas Atas"]
             netral_lower = netral_row.iloc[0]["Batas Bawah"]
-            if cp and netral_upper is not None and pd.notna(netral_upper):
+            if cp is not None and netral_upper is not None and pd.notna(netral_upper):
                 mos_upper = (netral_upper - cp) / netral_upper * 100
-                mos_lower = (netral_lower - cp) / netral_lower * 100 if (netral_lower is not None and pd.notna(netral_lower) and netral_lower != 0) else None
+                mos_lower = (netral_lower - cp) / netral_lower * 100 if (netral_lower is not None and netral_lower != 0) else None
 
                 mos_col1, mos_col2, mos_col3 = st.columns(3)
                 mos_col1.metric("Harga Saat Ini", fmt_rp_short(cp))
@@ -833,35 +901,46 @@ if st.session_state.data is not None:
 
         # ── PDF Download ──────────────────────────────────────────────────────
         st.divider()
-        ticker_clean = st.session_state.symbol.replace(".JK", "")
+        ticker_clean = (st.session_state.get("symbol") or "SAHAM").replace(".JK", "")
         pdf_filename = f"{ticker_clean}_PRHS_{datetime.now().strftime('%Y%m%d')}.pdf"
 
         # Auto-generate PDF ketika parameter berubah (cache by key)
-        pdf_cache_key = f"{st.session_state.symbol}|{eps_estimated}|{bvps_input}|{per_industri}|{pbv_industri}|{hash(edited_df.to_json())}"
+        pdf_cache_key = (
+            f"{st.session_state.get('symbol')}|{eps_estimated}|{bvps_input}"
+            f"|{per_industri}|{pbv_industri}|{hash(edited_df.to_json())}"
+        )
         if st.session_state.get("_pdf_key") != pdf_cache_key:
             with st.spinner("Menyiapkan laporan PDF …"):
-                st.session_state._pdf_bytes = generate_pdf(
-                    data=data,
-                    hist_df=edited_df,
-                    scenarios_df=scenarios_df,
-                    eps_estimated=eps_estimated,
-                    bvps_input=bvps_input,
-                    per_industri=per_industri,
-                    pbv_industri=pbv_industri,
-                    cagr=cagr,
-                    cp=cp,
-                    fig=fig,
-                )
-                st.session_state._pdf_key = pdf_cache_key
+                try:
+                    st.session_state._pdf_bytes = generate_pdf(
+                        data=data,
+                        hist_df=edited_df,
+                        scenarios_df=scenarios_df,
+                        eps_estimated=eps_estimated,
+                        bvps_input=bvps_input,
+                        per_industri=per_industri,
+                        pbv_industri=pbv_industri,
+                        cagr=cagr,
+                        cp=cp,
+                        fig=fig,
+                    )
+                    st.session_state._pdf_key = pdf_cache_key
+                except ImportError:
+                    st.session_state._pdf_bytes = None
+                    st.warning("⚠️ PDF tidak tersedia — install `reportlab`: `pip install reportlab`")
+                except Exception as pdf_err:
+                    st.session_state._pdf_bytes = None
+                    st.warning(f"⚠️ Gagal membuat PDF: {pdf_err}")
 
-        st.download_button(
-            "⬇️ Download as PDF",
-            data=st.session_state._pdf_bytes,
-            file_name=pdf_filename,
-            mime="application/pdf",
-            type="primary",
-            use_container_width=True,
-        )
+        if st.session_state.get("_pdf_bytes"):
+            st.download_button(
+                "⬇️ Download as PDF",
+                data=st.session_state._pdf_bytes,
+                file_name=pdf_filename,
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+            )
 
     else:
         st.warning("⚠️ Masukkan **EPS Estimasi Tahun Depan** untuk menghitung perkiraan harga.")
