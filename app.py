@@ -93,8 +93,12 @@ def _yf_call(fn, retries=3):
             raise
 
 
-def _parse_financials(fin, shares: float, existing: dict) -> dict:
-    """Ekstrak EPS per tahun dari DataFrame financials yfinance."""
+def _parse_financials(fin, shares: float, existing: dict, quarterly: bool = False) -> dict:
+    """Ekstrak EPS per tahun dari DataFrame financials yfinance.
+
+    Annual: satu kolom per tahun fiskal → langsung pakai.
+    Quarterly: jumlahkan 4 kuartal per tahun (hanya tahun yang lengkap).
+    """
     result = dict(existing)
     if fin is None or (hasattr(fin, "empty") and fin.empty):
         return result
@@ -104,19 +108,40 @@ def _parse_financials(fin, shares: float, existing: dict) -> dict:
     if not ni_key:
         return result
     ni = fin.loc[ni_key]
-    for col in ni.index:
-        try:
-            yr = pd.to_datetime(col).year
-        except Exception:
-            continue
-        val = ni[col]
-        if pd.notna(val) and yr not in result:
-            result[yr] = float(val) / shares
+
+    if not quarterly:
+        for col in ni.index:
+            try:
+                yr = pd.to_datetime(col).year
+            except Exception:
+                continue
+            val = ni[col]
+            if pd.notna(val) and yr not in result:
+                result[yr] = float(val) / shares
+    else:
+        # Kumpulkan semua kuartal per tahun, lalu jumlahkan
+        year_quarters: dict[int, list] = {}
+        for col in ni.index:
+            try:
+                yr = pd.to_datetime(col).year
+            except Exception:
+                continue
+            val = ni[col]
+            if pd.notna(val):
+                year_quarters.setdefault(yr, []).append(float(val))
+        for yr, vals in year_quarters.items():
+            # Hanya pakai tahun yang benar-benar memiliki 4 kuartal
+            if len(vals) == 4 and yr not in result:
+                result[yr] = sum(vals) / shares
     return result
 
 
-def _parse_balance_sheet(bs, shares: float, existing: dict) -> dict:
-    """Ekstrak BVPS per tahun dari DataFrame balance sheet yfinance."""
+def _parse_balance_sheet(bs, shares: float, existing: dict, quarterly: bool = False) -> dict:
+    """Ekstrak BVPS per tahun dari DataFrame balance sheet yfinance.
+
+    Annual: satu kolom per tahun → langsung pakai.
+    Quarterly: gunakan nilai per tanggal terbaru di setiap tahun (= kuartal Q4/akhir tahun).
+    """
     result = dict(existing)
     if bs is None or (hasattr(bs, "empty") and bs.empty):
         return result
@@ -128,14 +153,32 @@ def _parse_balance_sheet(bs, shares: float, existing: dict) -> dict:
     if not eq_key:
         return result
     eq = bs.loc[eq_key]
-    for col in eq.index:
-        try:
-            yr = pd.to_datetime(col).year
-        except Exception:
-            continue
-        val = eq[col]
-        if pd.notna(val) and yr not in result:
-            result[yr] = float(val) / shares
+
+    if not quarterly:
+        for col in eq.index:
+            try:
+                yr = pd.to_datetime(col).year
+            except Exception:
+                continue
+            val = eq[col]
+            if pd.notna(val) and yr not in result:
+                result[yr] = float(val) / shares
+    else:
+        # Untuk BVPS kuartalan: pakai nilai pada tanggal terbaru per tahun (= Q4)
+        year_latest: dict[int, tuple] = {}  # yr -> (date, val)
+        for col in eq.index:
+            try:
+                dt = pd.to_datetime(col)
+                yr = dt.year
+            except Exception:
+                continue
+            val = eq[col]
+            if pd.notna(val):
+                if yr not in year_latest or dt > year_latest[yr][0]:
+                    year_latest[yr] = (dt, float(val))
+        for yr, (_, val) in year_latest.items():
+            if yr not in result:
+                result[yr] = val / shares
     return result
 
 
@@ -188,9 +231,13 @@ def fetch_stock_data(symbol: str) -> dict:
         hist = pd.DataFrame()
     if not hist.empty:
         hist.index = pd.to_datetime(hist.index)
+        # Hapus timezone agar operasi .year konsisten (yfinance kadang tz-aware)
+        if hist.index.tz is not None:
+            hist.index = hist.index.tz_convert(None)
         hist["Year"] = hist.index.year
         grp = hist.groupby("Year").agg(High=("High", "max"), Low=("Low", "min"))
-        grp = grp[grp.index <= datetime.now().year]
+        # Exclude tahun berjalan (data belum lengkap Jan–Des)
+        grp = grp[grp.index < datetime.now().year]
         grp = grp.tail(5)
         for yr, row in grp.iterrows():
             annual_prices.append({"Tahun": int(yr), "Harga Tertinggi": row["High"], "Harga Terendah": row["Low"]})
@@ -198,15 +245,15 @@ def fetch_stock_data(symbol: str) -> dict:
     # ---- Annual EPS — coba beberapa sumber secara berurutan ----
     eps_by_year: dict[int, float] = {}
     if shares and shares > 0:
-        for fin_fn in [
-            lambda: ticker.financials,         # annual (API lama)
-            lambda: ticker.income_stmt,        # annual (API baru yfinance ≥ 0.2)
-            lambda: ticker.quarterly_financials,
-            lambda: ticker.quarterly_income_stmt,
+        for is_quarterly, fin_fn in [
+            (False, lambda: ticker.financials),          # annual (API lama)
+            (False, lambda: ticker.income_stmt),         # annual (API baru yfinance ≥ 0.2)
+            (True,  lambda: ticker.quarterly_financials),
+            (True,  lambda: ticker.quarterly_income_stmt),
         ]:
             try:
                 fin = _yf_call(fin_fn)
-                eps_by_year = _parse_financials(fin, shares, eps_by_year)
+                eps_by_year = _parse_financials(fin, shares, eps_by_year, quarterly=is_quarterly)
                 if len(eps_by_year) >= 2:
                     break
             except Exception:
@@ -219,14 +266,14 @@ def fetch_stock_data(symbol: str) -> dict:
     # ---- Annual BVPS — coba beberapa sumber secara berurutan ----
     bvps_by_year: dict[int, float] = {}
     if shares and shares > 0:
-        for bs_fn in [
-            lambda: ticker.balance_sheet,          # annual (API lama)
-            lambda: ticker.get_balance_sheet(),    # annual (API baru)
-            lambda: ticker.quarterly_balance_sheet,
+        for is_quarterly, bs_fn in [
+            (False, lambda: ticker.balance_sheet),           # annual (API lama)
+            (False, lambda: ticker.get_balance_sheet()),     # annual (API baru)
+            (True,  lambda: ticker.quarterly_balance_sheet),
         ]:
             try:
                 bs = _yf_call(bs_fn)
-                bvps_by_year = _parse_balance_sheet(bs, shares, bvps_by_year)
+                bvps_by_year = _parse_balance_sheet(bs, shares, bvps_by_year, quarterly=is_quarterly)
                 if len(bvps_by_year) >= 2:
                     break
             except Exception:
@@ -328,7 +375,7 @@ def calculate_scenarios(
     # ── 1. Estimasi Optimis ──────────────────────────────────────────────────
     # Batas Atas  = max(PER Tertinggi 5 thn) × EPS estimated
     # Batas Bawah = max(PER Terendah  5 thn) × EPS estimated
-    if not valid_per.empty:
+    if not valid_per.empty and eps_est and eps_est > 0:
         max_per_h = valid_per["PER Tertinggi"].max()
         max_per_l = valid_per["PER Terendah"].max()
         results.append({
@@ -343,7 +390,7 @@ def calculate_scenarios(
     # ── 2. Estimasi Netral ───────────────────────────────────────────────────
     # Batas Atas  = avg(PER Tertinggi 5 thn) × EPS estimated
     # Batas Bawah = avg(PER Terendah  5 thn) × EPS estimated
-    if not valid_per.empty:
+    if not valid_per.empty and eps_est and eps_est > 0:
         avg_per_h = valid_per["PER Tertinggi"].mean()
         avg_per_l = valid_per["PER Terendah"].mean()
         results.append({
@@ -961,9 +1008,8 @@ if st.session_state.data is not None:
     # ── Reset Button ──────────────────────────────────────────────────────
     st.divider()
     if st.button("🔄 Reset — Mulai Analisis Baru", type="secondary", use_container_width=True):
-        for key in ["data", "hist_df", "symbol", "hist_editor", "_pdf_bytes", "_pdf_key"]:
+        for key in ["data", "hist_df", "symbol", "hist_editor", "_pdf_bytes", "_pdf_key", "ticker_input"]:
             st.session_state.pop(key, None)
-        st.session_state["ticker_input"] = ""
         st.rerun()
 
 else:
