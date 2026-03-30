@@ -218,6 +218,7 @@ def fetch_stock_data(symbol: str) -> dict:
     current_price = _cp if _cp is not None else fast_price
     current_eps   = safe_get(info, "trailingEps")
     current_bvps  = safe_get(info, "bookValue")
+    forward_eps   = safe_get(info, "forwardEps")
     _sh           = safe_get(info, "sharesOutstanding")
     shares        = _sh if _sh is not None else fast_shares
     sector        = info.get("sector", "")
@@ -289,6 +290,7 @@ def fetch_stock_data(symbol: str) -> dict:
         "current_price": current_price,
         "current_eps": current_eps,
         "current_bvps": current_bvps,
+        "forward_eps": forward_eps,
         "shares": shares,
         "annual_prices": annual_prices,
         "eps_by_year": eps_by_year,
@@ -831,24 +833,67 @@ if st.session_state.data is not None:
 
     col_left, col_right = st.columns(2)
 
+    # ── Inisialisasi session state untuk preset EPS (direset per simbol) ──
+    sym_key = st.session_state.get("symbol", "")
+    _eps_ver_key    = f"eps_ver_{sym_key}"
+    _eps_preset_key = f"eps_preset_{sym_key}"
+    if _eps_ver_key not in st.session_state:
+        st.session_state[_eps_ver_key]    = 0
+        st.session_state[_eps_preset_key] = (
+            float(round(eps_auto, 2)) if (eps_auto is not None and eps_auto > 0) else 0.0
+        )
+
+    forward_eps = data.get("forward_eps")
+
     with col_left:
         st.markdown("**EPS & BVPS**")
+
+        # ── Baris referensi CAGR ──
         if cagr is not None and eps_auto is not None:
             st.info(
                 f"📈 CAGR EPS historis: **{cagr*100:.1f}% / tahun**  |  "
                 f"EPS terakhir: **{fmt_rp(latest_eps)}**  →  "
-                f"EPS est. otomatis: **{fmt_rp(eps_auto)}**"
+                f"EPS est. (CAGR): **{fmt_rp(eps_auto)}**"
             )
         else:
-            st.warning("⚠️ Data EPS historis tidak lengkap — masukkan EPS estimated secara manual.")
+            st.warning("⚠️ Data EPS historis tidak lengkap — masukkan EPS Estimated secara manual.")
+
+        # ── Forward EPS dari analis ──
+        if forward_eps is not None and forward_eps > 0:
+            fw_col, btn_col = st.columns([3, 1])
+            fw_col.success(
+                f"🔮 **Forward EPS (konsensus analis):** {fmt_rp(forward_eps)}  \n"
+                f"*Sumber: Yahoo Finance — estimasi analis untuk 12 bulan ke depan.*"
+            )
+            if btn_col.button("⬆️ Pakai\nnilai ini", use_container_width=True,
+                              help="Set EPS Estimasi ke nilai Forward EPS dari analis"):
+                st.session_state[_eps_preset_key] = float(round(forward_eps, 2))
+                st.session_state[_eps_ver_key]   += 1
+                st.rerun()
+        else:
+            with st.expander("💡 Forward EPS tidak tersedia — lihat saran di sini", expanded=False):
+                st.markdown(
+                    "**Yahoo Finance tidak memiliki estimasi analis** untuk saham ini.  \n"
+                    "Berikut alternatif untuk mengisi EPS Estimasi secara akurat:\n\n"
+                    "| Sumber | Cara Akses |\n"
+                    "|--------|------------|\n"
+                    "| **RTI Business** | rti.co.id → cari kode saham → tab *Consensus* |\n"
+                    "| **Stockbit** | stockbit.com → saham → *Forecast* (perlu akun) |\n"
+                    "| **IDX.co.id** | Laporan keuangan terbaru → Laba Bersih ÷ Jumlah Saham |\n"
+                    "| **Hitung manual** | Laba bersih guidance manajemen ÷ saham beredar |\n"
+                    "| **Konservatif** | Gunakan EPS TTM (trailing) = sama dengan tahun lalu |\n\n"
+                    f"*EPS TTM saat ini: **{fmt_rp(data['current_eps'])}** "
+                    f"({'tersedia' if data['current_eps'] else 'tidak tersedia'})*"
+                )
 
         eps_estimated = st.number_input(
             "EPS Estimasi Tahun Depan (Rp) ✏️",
             min_value=0.0,
-            value=float(round(eps_auto, 2)) if (eps_auto is not None and eps_auto > 0) else 0.0,
+            value=st.session_state[_eps_preset_key],
             step=10.0,
             format="%.2f",
-            help="Dihitung otomatis dengan CAGR historis. Anda bisa mengubahnya.",
+            help="Dihitung otomatis dari CAGR historis. Klik '⬆️ Pakai nilai ini' untuk menggunakan Forward EPS analis.",
+            key=f"eps_input_{st.session_state[_eps_ver_key]}",
         )
 
         bvps_input = st.number_input(
@@ -1008,7 +1053,13 @@ if st.session_state.data is not None:
     # ── Reset Button ──────────────────────────────────────────────────────
     st.divider()
     if st.button("🔄 Reset — Mulai Analisis Baru", type="secondary", use_container_width=True):
-        for key in ["data", "hist_df", "symbol", "hist_editor", "_pdf_bytes", "_pdf_key", "ticker_input"]:
+        sym_key = st.session_state.get("symbol", "")
+        keys_to_clear = [
+            "data", "hist_df", "symbol", "hist_editor",
+            "_pdf_bytes", "_pdf_key", "ticker_input",
+            f"eps_ver_{sym_key}", f"eps_preset_{sym_key}",
+        ]
+        for key in keys_to_clear:
             st.session_state.pop(key, None)
         st.rerun()
 
