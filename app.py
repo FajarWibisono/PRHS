@@ -583,15 +583,15 @@ def generate_pdf(
     # ── Key Metrics ───────────────────────────────────────────────────────────
     story.append(Paragraph("Metrik Utama", heading_s))
     eps_v = data['current_eps']
-    bv_v  = data['current_bvps']
+    bv_v  = bvps_input  # gunakan nilai input user, bukan raw yfinance
     met_data = [
         ["Harga Saat Ini", "EPS (TTM)", "BVPS", "PER Saat Ini", "PBV Saat Ini"],
         [
             fmt_rp_short(cp)   if cp  is not None else "N/A",
             fmt_rp(eps_v)      if eps_v is not None else "N/A",
-            fmt_rp(bv_v)       if bv_v  is not None else "N/A",
+            fmt_rp(bv_v)       if bv_v  else "N/A",
             f"{cp/eps_v:.2f}x" if (cp is not None and eps_v is not None and eps_v > 0) else "N/A",
-            f"{cp/bv_v:.2f}x"  if (cp is not None and bv_v  is not None and bv_v  > 0) else "N/A",
+            f"{cp/bv_v:.2f}x"  if (cp is not None and bv_v  and bv_v  > 0) else "N/A",
         ],
     ]
     story.append(Table(met_data, colWidths=[W/5]*5, style=tbl_style()))
